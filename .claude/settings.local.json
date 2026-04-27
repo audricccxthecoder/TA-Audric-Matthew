@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npx create-next-app@latest frontend --js --app --tailwind --eslint --no-src-dir --no-turbopack --import-alias \"@/*\" --use-npm)",
+      "Bash(npx shadcn@latest init -d --base-color slate)",
+      "Bash(npx shadcn@latest init -d)",
+      "Bash(npx shadcn@latest add input label card sheet separator avatar dropdown-menu toast badge dialog table select textarea -y)",
+      "Bash(npx shadcn@latest add input label card sheet separator avatar dropdown-menu sonner badge dialog table select textarea -y)",
+      "Bash(rm -rf frontend/.next)",
+      "Bash(mv frontend *)",
+      "PowerShell($ErrorActionPreference = 'Continue'; Get-ChildItem \"C:\\\\Users\\\\Asus\\\\.vscode\\\\TA-Audric Matthew\\\\frontend\" -Force | Select-Object Name, Mode, Attributes | Format-Table -AutoSize)",
+      "Bash(mkdir -p apps/frontend)",
+      "Bash(shopt -s dotglob)",
+      "Bash(mv frontend/* apps/frontend/)",
+      "Bash(mkdir -p src/repositories)",
+      "Bash(mv index.js src/server.js)",
+      "Bash(mv routes *)",
+      "Bash(mv controllers *)",
+      "Bash(mv middleware *)",
+      "Bash(mkdir -p database/_legacy)",
+      "Bash(mv apps/backend/database/migrations/001_initial_schema.sql database/_legacy/001_initial_schema_OLD.sql)",
+      "Bash(rmdir apps/backend/database/migrations apps/backend/database)",
+      "Bash(node -c src/server.js)",
+      "Bash(node -c src/middleware/authMiddleware.js)",
+      "Bash(node -c src/middleware/roleMiddleware.js)",
+      "Bash(node -c src/controllers/authController.js)",
+      "Bash(node -c src/routes/auth.js)"
+    ]
+  }
+}
