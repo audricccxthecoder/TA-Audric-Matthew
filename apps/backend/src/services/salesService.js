@@ -179,7 +179,7 @@ async function createSale({ user, items }) {
     const dbProduct = productMap.get(it.product_id);
     return {
       ...it, // Ambil product_id dan qty dari DB, bukan dari req.body user / inputan user
-      harga_satuan:Product.harga_jual // TIMPA harganya secara paksa dari DB!
+      harga_satuan: dbProduct.harga_jual // TIMPA harganya secara paksa dari DB!
     };
   });
   // Finishing bug fix security (Price Override)

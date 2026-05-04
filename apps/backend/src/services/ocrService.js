@@ -1,23 +1,56 @@
 // =================================================================
-// ocrService.js — Pipeline OCR untuk nota CETAK KOMPUTER
+// ocrService.js — Pipeline OCR (jalur CETAK + jalur TULISAN TANGAN)
 // =================================================================
-// Strategi 2 (Pipeline Preprocessing Bersyarat) — JALUR CETAK:
-//   1. Grayscale
-//   2. Otsu thresholding (manual, sharp tidak punya bawaan — kita
-//      hitung histogram lalu feed nilai threshold optimal ke sharp)
-//   3. Median blur kernel 3 (noise removal)
-//   (Hough deskewing dilewati untuk Pertemuan 8: nota cetak biasanya
-//    sudah tegak dari scanner/foto frontal. Akan ditangani di pertemuan
-//    berikutnya bersama jalur tulisan tangan via opencv4nodejs.)
+// Strategi 2 (Pipeline Preprocessing Bersyarat) — sub-bab 3.2.6.4:
+//
+//   JALUR CETAK (sharp):
+//     1. Grayscale
+//     2. Otsu thresholding (sharp tidak punya bawaan — kita hitung
+//        histogram lalu feed nilai threshold optimal ke sharp)
+//     3. Median blur kernel 3 (noise removal)
+//
+//   JALUR TULISAN TANGAN (opencv4nodejs):
+//     1. cv.cvtColor(BGR→GRAY)
+//     2. cv.adaptiveThreshold(255, GAUSSIAN_C, BINARY, 11, 2)
+//     3. cv.bilateralFilter(9, 75, 75)
+//     4. Deskew per-baris (deteksi baris via projection profile,
+//        hitung angle via minAreaRect contour, rotate per-line region)
+//     5. cv.dilate(kernel 2x2, iterations=1) — dilatasi morfologis ringan
 //
 // Setelah preprocessing → tesseract.js dengan trained data 'ind+eng'.
 // Hasil di-parse via regex untuk field: kode_barang, nama_barang, qty,
-// harga_beli, diskon_persen. Confidence per field = rata-rata confidence
-// kata-kata yang menyusun field tersebut.
+// harga_beli, diskon_persen.
+//
+// STRATEGI 3 — ambang confidence:
+//   - cetak: terima field jika rata-rata confidence kata >= 60
+//   - tulisan_tangan: terima jika >= 45 (lebih longgar)
 // =================================================================
 
 const sharp = require("sharp");
 const { createWorker } = require("tesseract.js");
+
+// opencv4nodejs lazy-load: kalau native build gagal di Windows, jangan
+// crash boot server. Pipeline tulisan tangan akan throw error spesifik
+// yang ditangkap purchasesService → fallback Strategi 4 manual_input.
+let _cv = null;
+let _cvLoadError = null;
+function getCv() {
+  if (_cv) return _cv;
+  if (_cvLoadError) throw _cvLoadError;
+  try {
+    _cv = require("@u4/opencv4nodejs");
+    return _cv;
+  } catch (err) {
+    _cvLoadError = new Error(
+      "OCV_NOT_AVAILABLE: modul @u4/opencv4nodejs belum terpasang/ter-build. " +
+        "Jalankan `npm install @u4/opencv4nodejs` di apps/backend dan pastikan " +
+        "Visual Studio Build Tools (C++ workload) + CMake terpasang. " +
+        "Jalur OCR tulisan tangan otomatis fallback ke input manual sampai siap."
+    );
+    _cvLoadError.code = "OCV_NOT_AVAILABLE";
+    throw _cvLoadError;
+  }
+}
 
 // ---------- 1. Otsu Thresholding manual (sharp tidak punya) ----------
 // Input: Buffer raw grayscale 1-channel. Output: nilai threshold 0..255.
@@ -266,7 +299,7 @@ function flagLowConfidence(items, threshold = 60) {
   });
 }
 
-// ---------- 6. Entry point untuk service layer ----------
+// ---------- 6a. Entry point CETAK ----------
 async function recognizePrintedReceipt(inputBuffer) {
   const { processed, otsuValue, width, height } = await preprocessPrinted(inputBuffer);
 
@@ -279,14 +312,209 @@ async function recognizePrintedReceipt(inputBuffer) {
 
   return {
     raw_text: rawText,
-    preprocessing: { otsu_threshold: otsuValue, width, height },
+    preprocessing: {
+      pipeline: "sharp/printed",
+      otsu_threshold: otsuValue,
+      width,
+      height,
+    },
+    items,
+  };
+}
+
+// =================================================================
+// JALUR TULISAN TANGAN (opencv4nodejs)
+// =================================================================
+
+// Detect baris teks via horizontal projection profile pada binary mask.
+// Return array of { yStart, yEnd } untuk setiap baris (band) terdeteksi.
+function detectTextLines(binaryMat, cv) {
+  // Sum piksel ink per baris
+  const height = binaryMat.rows;
+  const width = binaryMat.cols;
+  const rowSums = new Array(height).fill(0);
+  const data = binaryMat.getDataAsArray(); // 2D array
+  for (let y = 0; y < height; y++) {
+    let s = 0;
+    for (let x = 0; x < width; x++) {
+      // Setelah adaptiveThreshold + invert: tinta = 255, kertas = 0
+      if (data[y][x] > 0) s++;
+    }
+    rowSums[y] = s;
+  }
+  // Ambang: 1.5% lebar gambar dianggap "ada teks di baris ini"
+  const threshold = Math.max(3, Math.floor(width * 0.015));
+  const lines = [];
+  let inLine = false;
+  let yStart = 0;
+  for (let y = 0; y < height; y++) {
+    if (rowSums[y] >= threshold) {
+      if (!inLine) {
+        inLine = true;
+        yStart = y;
+      }
+    } else if (inLine) {
+      inLine = false;
+      const yEnd = y;
+      // Filter band yang terlalu tipis (< 8 px ≈ noise) atau sangat tebal
+      if (yEnd - yStart >= 8 && yEnd - yStart <= height * 0.5) {
+        lines.push({ yStart, yEnd });
+      }
+    }
+  }
+  if (inLine) lines.push({ yStart, yEnd: height });
+  return lines;
+}
+
+// Hitung skew angle untuk satu line region via minAreaRect dari kontur.
+// Range: -15..+15 deg, fallback 0 jika tidak ada kontur signifikan.
+function estimateLineSkew(lineMat, cv) {
+  // Find contours pada binary line region
+  const contours = lineMat.findContours(
+    cv.RETR_EXTERNAL,
+    cv.CHAIN_APPROX_SIMPLE
+  );
+  if (!contours || contours.length === 0) return 0;
+  // Ambil contour terbesar (asumsikan merepresentasikan blok teks)
+  let largest = contours[0];
+  for (const c of contours) {
+    if (c.area > largest.area) largest = c;
+  }
+  if (largest.area < 50) return 0;
+  const rect = largest.minAreaRect();
+  let angle = rect.angle;
+  // OpenCV minAreaRect angle convention: -90..0
+  if (angle < -45) angle += 90;
+  // Clamp ekstrim
+  if (angle < -15) angle = -15;
+  if (angle > 15) angle = 15;
+  return angle;
+}
+
+// Rotate satu line region by `angle` derajat lalu paste-back ke canvas baru.
+function deskewPerLineMat(binaryMat, cv) {
+  const lines = detectTextLines(binaryMat, cv);
+  if (lines.length === 0) return binaryMat;
+
+  const height = binaryMat.rows;
+  const width = binaryMat.cols;
+  // Canvas hitam (background = 0 setelah pipeline kita = kertas)
+  const out = new cv.Mat(height, width, cv.CV_8UC1, [0]);
+
+  for (const ln of lines) {
+    // Tambah padding atas/bawah supaya rotasi tidak crop teks
+    const pad = Math.min(8, ln.yStart, height - ln.yEnd);
+    const y0 = ln.yStart - pad;
+    const y1 = ln.yEnd + pad;
+    const region = binaryMat.getRegion(new cv.Rect(0, y0, width, y1 - y0));
+    const angle = estimateLineSkew(region.copy(), cv);
+    let rotated;
+    if (Math.abs(angle) < 0.5) {
+      rotated = region.copy();
+    } else {
+      const center = new cv.Point2(width / 2, (y1 - y0) / 2);
+      const M = cv.getRotationMatrix2D(center, angle, 1.0);
+      rotated = region.warpAffine(
+        M,
+        new cv.Size(width, y1 - y0),
+        cv.INTER_LINEAR,
+        cv.BORDER_CONSTANT,
+        new cv.Vec(0, 0, 0)
+      );
+    }
+    // Paste-back via copyTo
+    rotated.copyTo(out.getRegion(new cv.Rect(0, y0, width, y1 - y0)));
+  }
+  return out;
+}
+
+// Pipeline preprocessing utama untuk tulisan tangan.
+async function preprocessHandwritten(inputBuffer) {
+  const cv = getCv(); // throw OCV_NOT_AVAILABLE jika modul tidak ada
+
+  // Decode buffer → Mat. opencv4nodejs.imdecode menerima Buffer.
+  let src = cv.imdecode(inputBuffer);
+  if (!src || src.empty) {
+    throw new Error("Gagal decode gambar dengan opencv4nodejs");
+  }
+
+  // (1) Grayscale
+  const gray =
+    src.channels === 1 ? src : src.cvtColor(cv.COLOR_BGR2GRAY);
+
+  // (2) Adaptive threshold (Gaussian, blockSize=11, C=2). Hasil: tinta=255, kertas=0.
+  // Pakai THRESH_BINARY_INV agar tinta jadi foreground (untuk dilatasi & contour).
+  const adaptive = gray.adaptiveThreshold(
+    255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+    cv.THRESH_BINARY_INV,
+    11,
+    2
+  );
+
+  // (3) Bilateral filter — perlu input grayscale 1ch (bukan binary), supaya
+  // edge-preserving smoothing efektif. Kita filter `gray`, hasilnya kita
+  // re-threshold via adaptive lagi. (Pendekatan: smooth dulu, threshold di akhir
+  // untuk hasil lebih bersih daripada filter di binary.)
+  const smoothed = gray.bilateralFilter(9, 75, 75);
+  const adaptive2 = smoothed.adaptiveThreshold(
+    255,
+    cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+    cv.THRESH_BINARY_INV,
+    11,
+    2
+  );
+
+  // (4) Deskew per-baris
+  const deskewed = deskewPerLineMat(adaptive2, cv);
+
+  // (5) Dilatasi morfologis ringan, kernel 2x2, 1 iterasi
+  const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(2, 2));
+  const dilated = deskewed.dilate(kernel, new cv.Point2(-1, -1), 1);
+
+  // Tesseract butuh tinta gelap di latar terang → invert kembali.
+  const finalBin = dilated.bitwiseNot();
+
+  // Encode ke PNG buffer untuk diteruskan ke worker.
+  const pngBuffer = cv.imencode(".png", finalBin);
+
+  return {
+    processed: pngBuffer,
+    width: src.cols,
+    height: src.rows,
+    n_lines_detected: detectTextLines(adaptive2, cv).length,
+  };
+}
+
+// ---------- 6b. Entry point TULISAN TANGAN ----------
+async function recognizeHandwrittenReceipt(inputBuffer) {
+  const { processed, width, height, n_lines_detected } =
+    await preprocessHandwritten(inputBuffer);
+
+  const worker = await getWorker();
+  const { data } = await worker.recognize(processed);
+  const rawText = data.text || "";
+
+  let items = parseTesseractData(data);
+  items = flagLowConfidence(items, 45); // Strategi 3: ambang tulisan tangan
+
+  return {
+    raw_text: rawText,
+    preprocessing: {
+      pipeline: "opencv/handwritten",
+      width,
+      height,
+      n_lines_detected,
+    },
     items,
   };
 }
 
 module.exports = {
   recognizePrintedReceipt,
+  recognizeHandwrittenReceipt,
   preprocessPrinted,
+  preprocessHandwritten,
   computeOtsuThreshold,
   parseTesseractData,
   flagLowConfidence,

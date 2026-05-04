@@ -1,17 +1,26 @@
 const purchasesService = require("../services/purchasesService");
 
 // POST /api/purchases/ocr (multipart/form-data, field "file")
+// Optional body: no_nota_supplier, nota_type ('cetak'|'tulisan_tangan')
 async function processOcr(req, res) {
   try {
     const result = await purchasesService.processOcr({
       user: req.user,
       file: req.file,
       noNotaSupplier: req.body?.no_nota_supplier,
+      notaType: req.body?.nota_type, // undefined → auto-classify (Strategi 1)
     });
-    return res.status(200).json({
-      message: "OCR berhasil — silakan validasi hasil sebelum simpan",
-      data: result,
-    });
+
+    // Pesan sesuai status hasil (Strategi 1 / Strategi 4)
+    let message = "OCR berhasil — silakan validasi hasil sebelum simpan";
+    if (result.status === "ambiguous_classification") {
+      message =
+        "Sistem tidak yakin jenis nota — mohon konfirmasi: cetak atau tulisan tangan";
+    } else if (result.status === "manual_input_required") {
+      message =
+        "Kualitas hasil OCR rendah — silakan lanjut dengan input manual";
+    }
+    return res.status(200).json({ message, data: result });
   } catch (err) {
     const status = err.status || 500;
     if (status >= 500) {

@@ -133,4 +133,19 @@ async function getMe(req, res) {
   });
 }
 
-module.exports = { login, logout, register, getMe };
+// GET /api/users — daftar user, dipakai filter audit-trail (admin only)
+async function listUsers(req, res) {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from("users")
+      .select("id, username, role, created_at")
+      .order("username", { ascending: true });
+    if (error) throw error;
+    res.json({ data: data || [] });
+  } catch (err) {
+    console.error("[POS-AUTH] listUsers error:", err.message);
+    res.status(500).json({ error: "Gagal memuat daftar user" });
+  }
+}
+
+module.exports = { login, logout, register, getMe, listUsers };

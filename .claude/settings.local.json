@@ -25,7 +25,19 @@
       "Bash(node -c src/middleware/authMiddleware.js)",
       "Bash(node -c src/middleware/roleMiddleware.js)",
       "Bash(node -c src/controllers/authController.js)",
-      "Bash(node -c src/routes/auth.js)"
+      "Bash(node -c src/routes/auth.js)",
+      "Bash(npm --prefix apps/backend install tesseract.js sharp fast-levenshtein)",
+      "Bash(node -c apps/backend/src/services/ocrService.js)",
+      "Bash(node -c apps/backend/src/services/stringMatchingService.js)",
+      "Bash(node -c apps/backend/src/services/purchasesService.js)",
+      "Bash(node -c apps/backend/src/services/ruleEngine.js)",
+      "Bash(node -c apps/backend/src/repositories/purchaseRepository.js)",
+      "Bash(node *)",
+      "Bash(git -C apps/frontend status --short)",
+      "Bash(git -C apps/frontend log --oneline -3)",
+      "Bash(git ls-tree *)",
+      "Bash(git -C apps/frontend add app/globals.css app/layout.js app/page.js app/dashboard app/kasir app/login app/stok-masuk components contexts lib components.json package.json package-lock.json)",
+      "Bash(git *)"
     ]
   }
 }

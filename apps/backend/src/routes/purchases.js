@@ -10,19 +10,18 @@ const {
 const authMiddleware = require("../middleware/authMiddleware");
 const roleMiddleware = require("../middleware/roleMiddleware");
 
-// Pertemuan 8: jalur nota CETAK saja → image (JPG/PNG/WebP).
-// Jalur PDF + tulisan tangan menyusul di pertemuan berikutnya.
-const PRINTED_MIME_RE = /^image\/(jpeg|jpg|png|webp)$/i;
+// Pertemuan 9: terima JPG/PNG/WebP. Klasifikasi cetak vs tulisan tangan
+// dilakukan di service layer (Strategi 1). PDF belum didukung — perlu
+// pdf-to-image converter terpisah, di luar scope laporan saat ini.
+const ACCEPTED_MIME_RE = /^image\/(jpeg|jpg|png|webp)$/i;
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
   fileFilter: (req, file, cb) => {
-    if (!PRINTED_MIME_RE.test(file.mimetype)) {
+    if (!ACCEPTED_MIME_RE.test(file.mimetype)) {
       return cb(
-        new Error(
-          "Format tidak didukung. Pertemuan 8 hanya menerima JPG/PNG/WebP (nota cetak)."
-        )
+        new Error("Format tidak didukung. Gunakan JPG / PNG / WebP.")
       );
     }
     cb(null, true);

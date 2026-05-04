@@ -8,6 +8,10 @@ const userRoutes = require("./routes/users");
 const productRoutes = require("./routes/products");
 const salesRoutes = require("./routes/sales");
 const purchaseRoutes = require("./routes/purchases");
+const dashboardRoutes = require("./routes/dashboard");
+const auditRoutes = require("./routes/audit");
+const reportsRoutes = require("./routes/reports");
+const restockRoutes = require("./routes/restock");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -48,6 +52,10 @@ app.use("/api/users", userRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/sales", salesRoutes);
 app.use("/api/purchases", purchaseRoutes);
+app.use("/api/dashboard", dashboardRoutes);
+app.use("/api/audit-logs", auditRoutes);
+app.use("/api/reports", reportsRoutes);
+app.use("/api/restock", restockRoutes);
 
 app.use((err, req, res, next) => {
   console.error("[POS-SRV]", err.stack);

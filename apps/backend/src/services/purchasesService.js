@@ -1,28 +1,81 @@
 // =================================================================
 // purchasesService.js — Orkestrator OCR + Validasi + Commit Pembelian
 // =================================================================
-// Alur Gambar 3.6 di laporan (jalur nota CETAK KOMPUTER untuk Pertemuan 8):
-//   1. POST /api/purchases/ocr  — upload file → simpan Storage → preprocessing
-//      → tesseract → parse field → Levenshtein top-3 → return draft 'unsaved'
+// Pertemuan 8: jalur nota CETAK (sharp + tesseract).
+// Pertemuan 9: tambah jalur TULISAN TANGAN (opencv4nodejs) + 4 Strategi
+//              mitigasi (sub-bab 3.2.6.4):
+//   - Strategi 1: Klasifikasi awal jenis nota (cetak / tulisan_tangan / ambigu)
+//   - Strategi 2: Pipeline preprocessing bersyarat (sharp vs opencv)
+//   - Strategi 3: Ambang confidence berbeda (60 cetak vs 45 tulisan tangan)
+//   - Strategi 4: Fallback agresif ke input manual jika kualitas terlalu rendah
+//
+// Alur Gambar 3.6 di laporan:
+//   1. POST /api/purchases/ocr  — upload file → simpan Storage → klasifikasi →
+//      preprocessing → tesseract → parse field → Levenshtein top-3 → return
+//      draft 'unsaved'  ATAU  status 'ambiguous_classification'  ATAU
+//      'manual_input_required'
 //   2. POST /api/purchases/commit — payload tervalidasi user → R2 check →
 //      RPC fn_commit_purchase (atomik). Trigger R4 menambah stok + log.
 // =================================================================
 
 const ocrService = require("./ocrService");
+const notaClassifier = require("./notaClassifierService");
 const stringMatcher = require("./stringMatchingService");
 const ruleEngine = require("./ruleEngine");
 const purchaseRepository = require("../repositories/purchaseRepository");
 const stockLogRepository = require("../repositories/stockLogRepository");
 
+// Strategi 4 — ambang fallback (untuk jalur tulisan tangan).
+const STRAT4_EMPTY_FIELD_PCT = 0.4; // > 40% field kosong → fallback
+const STRAT4_AVG_CONFIDENCE_MIN = 30; // avg confidence < 30 → fallback
+
+// Hitung statistik untuk Strategi 4: persentase field kosong & avg confidence keseluruhan.
+function computeOcrQualityStats(items) {
+  if (!items || items.length === 0) {
+    return { empty_pct: 1, avg_confidence: 0, total_fields: 0 };
+  }
+  const FIELDS = ["kode_barang", "nama_barang", "qty", "harga_beli"];
+  let totalFields = 0;
+  let emptyFields = 0;
+  let confSum = 0;
+  let confCount = 0;
+  for (const it of items) {
+    for (const f of FIELDS) {
+      totalFields++;
+      const v = it.raw?.[f];
+      if (v === undefined || v === null || v === "" || v === 0) emptyFields++;
+      const c = it.confidence?.[f];
+      if (typeof c === "number" && c > 0) {
+        confSum += c;
+        confCount++;
+      }
+    }
+  }
+  return {
+    empty_pct: totalFields > 0 ? emptyFields / totalFields : 1,
+    avg_confidence: confCount > 0 ? confSum / confCount : 0,
+    total_fields: totalFields,
+  };
+}
+
+// Validasi nilai nota_type yang diterima dari client/auto-classify.
+function normalizeNotaType(t) {
+  if (t === "cetak" || t === "tulisan_tangan") return t;
+  return null;
+}
+
 // ---------- /api/purchases/ocr ----------
-async function processOcr({ user, file, noNotaSupplier }) {
+// Body field: file (multipart) + opsional no_nota_supplier + opsional nota_type.
+// nota_type: 'cetak' | 'tulisan_tangan' | undefined → auto-classify.
+async function processOcr({ user, file, noNotaSupplier, notaType }) {
   if (!file || !file.buffer) {
     const e = new Error("File nota wajib diunggah");
     e.status = 400;
     throw e;
   }
 
-  // (a) Simpan file ke Supabase Storage (jalur cetak: image only — JPG/PNG/WebP)
+  // (a) Simpan file ke Supabase Storage. File tetap disimpan walau OCR
+  // nantinya gagal/fallback — penting untuk audit (Strategi 4).
   const filePath = await purchaseRepository.uploadNota({
     userId: user.id,
     originalName: file.originalname,
@@ -31,18 +84,93 @@ async function processOcr({ user, file, noNotaSupplier }) {
   });
   const signedUrl = await purchaseRepository.createNotaSignedUrl(filePath);
 
-  // (b) Pipeline preprocessing CETAK + OCR
+  // (b) STRATEGI 1 — klasifikasi awal jika user belum override.
+  let resolvedType = normalizeNotaType(notaType);
+  let classification = null;
+  if (!resolvedType) {
+    try {
+      classification = await notaClassifier.classifyNota(file.buffer);
+    } catch (err) {
+      console.warn("[POS-OCR] classifier error:", err.message);
+      classification = { type: "ambigu", features: { error: err.message } };
+    }
+
+    if (classification.type === "ambigu") {
+      // Stop di sini — frontend akan tampilkan radio button untuk konfirmasi.
+      console.log(
+        `[POS-OCR] User=${user.username} klasifikasi=AMBIGU → minta konfirmasi user`
+      );
+      return {
+        status: "ambiguous_classification",
+        file_nota_url: filePath,
+        file_nota_signed_url: signedUrl,
+        no_nota_supplier: noNotaSupplier || null,
+        classification,
+        message:
+          "Sistem tidak yakin jenis nota ini. Mohon pilih: cetak komputer atau tulisan tangan.",
+      };
+    }
+    resolvedType = classification.type;
+  }
+
+  // (c) STRATEGI 2 — pipeline bersyarat
   let ocrResult;
   try {
-    ocrResult = await ocrService.recognizePrintedReceipt(file.buffer);
+    if (resolvedType === "tulisan_tangan") {
+      ocrResult = await ocrService.recognizeHandwrittenReceipt(file.buffer);
+    } else {
+      ocrResult = await ocrService.recognizePrintedReceipt(file.buffer);
+    }
   } catch (err) {
+    // OCV_NOT_AVAILABLE: opencv4nodejs belum ter-install / build gagal.
+    // Sesuai semangat Strategi 4 → fallback ke input manual.
+    if (err.code === "OCV_NOT_AVAILABLE" && resolvedType === "tulisan_tangan") {
+      console.warn("[POS-OCR] opencv unavailable → fallback ke manual input");
+      return {
+        status: "manual_input_required",
+        file_nota_url: filePath,
+        file_nota_signed_url: signedUrl,
+        no_nota_supplier: noNotaSupplier || null,
+        nota_type: resolvedType,
+        classification,
+        reason:
+          "Modul OCR tulisan tangan (opencv4nodejs) belum siap. Silakan input manual sementara.",
+        items: [],
+      };
+    }
     console.error("[POS-OCR] recognize error:", err.message);
     const e = new Error("Gagal memproses OCR pada file nota");
     e.status = 500;
     throw e;
   }
 
-  // (c) Levenshtein matching: untuk tiap item OCR, cari top-3 candidate
+  // (d) STRATEGI 4 — fallback agresif untuk tulisan tangan kualitas rendah
+  const quality = computeOcrQualityStats(ocrResult.items);
+  if (
+    resolvedType === "tulisan_tangan" &&
+    (quality.empty_pct > STRAT4_EMPTY_FIELD_PCT ||
+      quality.avg_confidence < STRAT4_AVG_CONFIDENCE_MIN)
+  ) {
+    console.warn(
+      `[POS-OCR] Strategi 4 fallback: empty_pct=${quality.empty_pct.toFixed(2)} avg_conf=${quality.avg_confidence.toFixed(1)}`
+    );
+    return {
+      status: "manual_input_required",
+      file_nota_url: filePath,
+      file_nota_signed_url: signedUrl,
+      no_nota_supplier: noNotaSupplier || null,
+      nota_type: resolvedType,
+      classification,
+      preprocessing: ocrResult.preprocessing,
+      raw_text: ocrResult.raw_text,
+      quality,
+      reason:
+        "Kualitas hasil OCR terlalu rendah untuk divalidasi. Silakan input manual.",
+      items: [], // dosen wajib input dari nol — tapi raw_text tetap dikirim untuk referensi
+    };
+  }
+
+  // (e) Levenshtein matching: untuk tiap item OCR, cari top-3 candidate
   const catalog = await purchaseRepository.listActiveProductsForMatching();
   const itemsWithCandidates = ocrResult.items.map((item, idx) => ({
     index: idx,
@@ -60,16 +188,19 @@ async function processOcr({ user, file, noNotaSupplier }) {
   }));
 
   console.log(
-    `[POS-OCR] User=${user.username} processed nota=${noNotaSupplier || "(tanpa nomor)"} → ${itemsWithCandidates.length} item terdeteksi`
+    `[POS-OCR] User=${user.username} type=${resolvedType} processed nota=${noNotaSupplier || "(tanpa nomor)"} → ${itemsWithCandidates.length} item (avg_conf=${quality.avg_confidence.toFixed(1)}, empty=${(quality.empty_pct * 100).toFixed(0)}%)`
   );
 
   return {
     status: "unsaved",
-    file_nota_url: filePath, // path internal storage (bukan public URL)
-    file_nota_signed_url: signedUrl, // untuk preview di frontend
+    file_nota_url: filePath,
+    file_nota_signed_url: signedUrl,
     no_nota_supplier: noNotaSupplier || null,
+    nota_type: resolvedType,
+    classification,
     raw_text: ocrResult.raw_text,
     preprocessing: ocrResult.preprocessing,
+    quality,
     items: itemsWithCandidates,
   };
 }

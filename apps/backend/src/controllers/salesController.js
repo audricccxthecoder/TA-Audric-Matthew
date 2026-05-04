@@ -1,4 +1,17 @@
 const salesService = require("../services/salesService");
+const salesRepository = require("../repositories/salesRepository");
+
+// GET /api/sales/:id — detail transaksi (header + items) untuk drill-down
+async function getSaleDetail(req, res) {
+  try {
+    const data = await salesRepository.getReceipt(req.params.id);
+    if (!data) return res.status(404).json({ error: "Transaksi tidak ditemukan" });
+    return res.json({ data });
+  } catch (err) {
+    console.error("[POS-SALES] getSaleDetail error:", err.message);
+    return res.status(500).json({ error: "Gagal memuat detail transaksi" });
+  }
+}
 
 // POST /api/sales
 async function createSale(req, res) {
@@ -44,4 +57,4 @@ async function listSales(req, res) {
   }
 }
 
-module.exports = { createSale, listSales };
+module.exports = { createSale, listSales, getSaleDetail };
