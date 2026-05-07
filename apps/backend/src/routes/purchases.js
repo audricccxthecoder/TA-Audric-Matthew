@@ -6,6 +6,10 @@ const {
   processOcr,
   commitPurchase,
   listPurchases,
+  saveDraft,
+  listDrafts,
+  getDraft,
+  deleteDraft,
 } = require("../controllers/purchasesController");
 const authMiddleware = require("../middleware/authMiddleware");
 const roleMiddleware = require("../middleware/roleMiddleware");
@@ -13,7 +17,7 @@ const roleMiddleware = require("../middleware/roleMiddleware");
 // Pertemuan 9: terima JPG/PNG/WebP. Klasifikasi cetak vs tulisan tangan
 // dilakukan di service layer (Strategi 1). PDF belum didukung — perlu
 // pdf-to-image converter terpisah, di luar scope laporan saat ini.
-const ACCEPTED_MIME_RE = /^image\/(jpeg|jpg|png|webp)$/i;
+const ACCEPTED_MIME_RE = /^(image\/(jpeg|jpg|png|webp)|application\/pdf)$/i;
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -21,7 +25,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     if (!ACCEPTED_MIME_RE.test(file.mimetype)) {
       return cb(
-        new Error("Format tidak didukung. Gunakan JPG / PNG / WebP.")
+        new Error("Format tidak didukung. Gunakan JPG / PNG / WebP / PDF.")
       );
     }
     cb(null, true);
@@ -48,5 +52,13 @@ function uploadSingleNota(req, res, next) {
 router.post("/ocr", uploadSingleNota, processOcr);
 router.post("/commit", commitPurchase);
 router.get("/", listPurchases);
+
+// Drafts: scan di HP → resume di laptop (atau sebaliknya).
+// Dipakai endpoints: POST /api/purchases/drafts (save), GET (list),
+// GET /:id (load one), DELETE /:id (cancel).
+router.get("/drafts", listDrafts);
+router.post("/drafts", express.json({ limit: "5mb" }), saveDraft);
+router.get("/drafts/:id", getDraft);
+router.delete("/drafts/:id", deleteDraft);
 
 module.exports = router;

@@ -122,6 +122,121 @@ async function listActiveProductsForMatching() {
   return data || [];
 }
 
+// =============== DRAFTS (Cross-device resume) ===============
+
+async function saveDraft({
+  draftId,
+  userId,
+  noNotaSupplier,
+  fileNotaUrl,
+  notaType,
+  rawText,
+  preprocessing,
+  quality,
+  items,
+  status,
+}) {
+  const payload = {
+    user_id: userId,
+    no_nota_supplier: noNotaSupplier || null,
+    file_nota_url: fileNotaUrl,
+    nota_type: notaType || null,
+    raw_text: rawText || null,
+    preprocessing: preprocessing || null,
+    quality: quality || null,
+    items: items || [],
+    status: status || "draft",
+  };
+
+  if (draftId) {
+    // UPSERT/UPDATE existing draft
+    const { data, error } = await supabase
+      .from("purchase_drafts")
+      .update(payload)
+      .eq("id", draftId)
+      .eq("user_id", userId) // defense-in-depth (RLS sudah enforce)
+      .select()
+      .single();
+    if (error) {
+      console.error("[POS-PURREPO] updateDraft error:", error.message);
+      throw new Error("Gagal menyimpan draft");
+    }
+    return data;
+  }
+
+  const { data, error } = await supabase
+    .from("purchase_drafts")
+    .insert(payload)
+    .select()
+    .single();
+  if (error) {
+    console.error("[POS-PURREPO] insertDraft error:", error.message);
+    throw new Error("Gagal menyimpan draft");
+  }
+  return data;
+}
+
+async function listDrafts(userId) {
+  const { data, error } = await supabase
+    .from("purchase_drafts")
+    .select(
+      "id, no_nota_supplier, file_nota_url, nota_type, status, created_at, updated_at, items"
+    )
+    .eq("user_id", userId)
+    .order("updated_at", { ascending: false });
+  if (error) {
+    console.error("[POS-PURREPO] listDrafts:", error.message);
+    throw new Error("Gagal memuat daftar draft");
+  }
+  // Tambah ringkasan: jumlah item, file_nota_signed_url
+  const result = [];
+  for (const d of data || []) {
+    result.push({
+      id: d.id,
+      no_nota_supplier: d.no_nota_supplier,
+      file_nota_url: d.file_nota_url,
+      file_nota_signed_url: await createNotaSignedUrl(d.file_nota_url),
+      nota_type: d.nota_type,
+      status: d.status,
+      item_count: Array.isArray(d.items) ? d.items.length : 0,
+      created_at: d.created_at,
+      updated_at: d.updated_at,
+    });
+  }
+  return result;
+}
+
+async function getDraft({ draftId, userId }) {
+  const { data, error } = await supabase
+    .from("purchase_drafts")
+    .select("*")
+    .eq("id", draftId)
+    .eq("user_id", userId)
+    .single();
+  if (error) {
+    if (error.code === "PGRST116") return null; // not found
+    console.error("[POS-PURREPO] getDraft:", error.message);
+    throw new Error("Gagal memuat draft");
+  }
+  return {
+    ...data,
+    file_nota_signed_url: await createNotaSignedUrl(data.file_nota_url),
+  };
+}
+
+async function deleteDraft({ draftId, userId }) {
+  const { error } = await supabase
+    .from("purchase_drafts")
+    .delete()
+    .eq("id", draftId)
+    .eq("user_id", userId);
+  if (error) {
+    console.error("[POS-PURREPO] deleteDraft:", error.message);
+    throw new Error("Gagal menghapus draft");
+  }
+  return true;
+}
+
 module.exports = {
   uploadNota,
   createNotaSignedUrl,
@@ -129,5 +244,9 @@ module.exports = {
   getPurchaseDetail,
   list,
   listActiveProductsForMatching,
+  saveDraft,
+  listDrafts,
+  getDraft,
+  deleteDraft,
   NOTA_BUCKET,
 };

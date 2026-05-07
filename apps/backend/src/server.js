@@ -35,9 +35,22 @@ app.use(
   })
 );
 
+// FRONTEND_URL boleh comma-separated — supaya satu backend bisa melayani
+// laptop (localhost:3000) dan HP via LAN (mis. 172.22.127.9:3000) bersamaan
+// untuk testing live-scan kamera HP.
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: (origin, cb) => {
+      // origin undefined = same-origin / curl / mobile webview tertentu → izinkan
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error(`CORS blocked: ${origin}`));
+    },
     credentials: true,
   })
 );

@@ -3,11 +3,19 @@
 // =================================================================
 // Strategi 2 (Pipeline Preprocessing Bersyarat) — sub-bab 3.2.6.4:
 //
-//   JALUR CETAK (sharp):
-//     1. Grayscale
-//     2. Otsu thresholding (sharp tidak punya bawaan — kita hitung
-//        histogram lalu feed nilai threshold optimal ke sharp)
-//     3. Median blur kernel 3 (noise removal)
+//   JALUR CETAK (sharp) — multi-pass:
+//     PASS 1 "gentle" (default — biarkan tesseract internal binarize):
+//       1. Upscale ke ~2400px width (tesseract optimal di ~300 DPI;
+//          foto HP umumnya 1500-2000px → upscale lanczos3)
+//       2. Grayscale + normalize (auto-contrast)
+//       3. Linear contrast boost (1.25, -20)
+//       4. Sharpen ringan (sigma 0.5)
+//     PASS 2 "aggressive" (fallback kalau pass 1 balas <= 1 item):
+//       1. Upscale ke 2400px
+//       2. Grayscale + normalize
+//       3. Median blur kernel 3
+//       4. Otsu thresholding (binarisasi keras)
+//     Plus: tesseract PSM=6 (single uniform block) + preserve_interword_spaces.
 //
 //   JALUR TULISAN TANGAN (opencv4nodejs):
 //     1. cv.cvtColor(BGR→GRAY)
@@ -94,30 +102,176 @@ function computeOtsuThreshold(rawGreyBuffer) {
   return threshold;
 }
 
-// ---------- 2. Pipeline preprocessing untuk nota CETAK ----------
-async function preprocessPrinted(inputBuffer) {
-  // (a) Grayscale
-  const grey = sharp(inputBuffer).greyscale();
+// ---------- 1b. Deteksi kertas berwarna (carbon paper merah muda, dll) -----
+// Sample mean per channel pada thumbnail kecil (cepat). Jika selisih warna > 18
+// pada salah satu pasangan kanal → paper berwarna → pipeline khusus.
+// Output: { is_colored, dominant_channel, mean_r, mean_g, mean_b }
+async function detectPaperColor(inputBuffer) {
+  // .rotate() tanpa argumen = auto-orient berdasarkan EXIF tag.
+  // Wajib untuk foto langsung dari kamera HP iPhone — raw pixel-nya
+  // sering miring meskipun visualnya tegak.
+  const { data, info } = await sharp(inputBuffer)
+    .rotate()
+    .resize(400, 400, { fit: "inside", withoutEnlargement: true })
+    .raw()
+    .toBuffer({ resolveWithObject: true });
 
-  // (b) Otsu thresholding — butuh raw buffer untuk hitung histogram
-  const { data: rawGrey, info } = await grey
-    .clone()
+  const channels = info.channels;
+  const totalPx = info.width * info.height;
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  for (let i = 0; i < data.length; i += channels) {
+    sumR += data[i];
+    sumG += data[i + 1];
+    sumB += data[i + 2];
+  }
+  const meanR = sumR / totalPx;
+  const meanG = sumG / totalPx;
+  const meanB = sumB / totalPx;
+
+  // Selisih signifikan antar kanal = kertas/tinta dominan satu warna.
+  const dRG = meanR - meanG;
+  const dRB = meanR - meanB;
+  const dGB = meanG - meanB;
+  const isColored =
+    Math.abs(dRG) > 18 || Math.abs(dRB) > 18 || Math.abs(dGB) > 18;
+
+  // Pilih channel yang paling "TIDAK MIRIP" warna paper untuk ekstraksi.
+  // Pink/merah → paper terang di B+G, gelap di R → ekstrak B (ink hitam tetap gelap, paper jadi terang).
+  // Biru carbon → ekstrak R. Hijau → ekstrak R atau B.
+  let dominantChannel = "blue";
+  if (meanR >= meanG && meanR >= meanB) dominantChannel = "blue"; // R dominan → kertas merah/pink → pakai B
+  else if (meanB >= meanR && meanB >= meanG) dominantChannel = "red"; // B dominan → kertas biru → pakai R
+  else if (meanG >= meanR && meanG >= meanB) dominantChannel = "red"; // G dominan → pakai R
+
+  return {
+    is_colored: isColored,
+    dominant_channel: dominantChannel,
+    mean_r: Math.round(meanR),
+    mean_g: Math.round(meanG),
+    mean_b: Math.round(meanB),
+  };
+}
+
+// ---------- 2. Pipeline preprocessing untuk nota CETAK ----------
+// Target width untuk upscaling. Tesseract optimal ~300 DPI. Foto HP umumnya
+// 1500-2000px, jadi naikkan ke 2400px supaya font kecil di tabel item kebaca.
+const PRINTED_TARGET_WIDTH = 2400;
+
+// Pipeline khusus kertas berwarna (carbon merah muda, biru, dll).
+// Ekstrak satu channel (yang paling kontras dengan warna paper), normalize,
+// median blur, lalu Otsu binarisasi. Ini fix utama untuk nota carbon
+// merah-muda — di grayscale standar tinta hitam dan kertas merah jatuh ke
+// abu-abu hampir sama (low contrast).
+async function preprocessPrintedColored(inputBuffer, channelName) {
+  const meta = await sharp(inputBuffer).rotate().metadata();
+  const targetWidth = Math.max(meta.width || 0, PRINTED_TARGET_WIDTH);
+  const ch = channelName === "red" ? "red" : channelName === "green" ? "green" : "blue";
+
+  // Step 1: rotate (auto-orient EXIF) → resize → extract single channel → normalize
+  const oneChannel = await sharp(inputBuffer)
+    .rotate()
+    .resize({ width: targetWidth, kernel: "lanczos3", withoutEnlargement: false })
+    .extractChannel(ch)
+    .normalize()
+    .toBuffer();
+
+  // Step 2: hitung Otsu pada raw 1-channel
+  const { data: rawCh } = await sharp(oneChannel)
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const otsuValue = computeOtsuThreshold(rawCh);
+
+  // Step 3: median blur (buang salt-and-pepper) + threshold
+  const processed = await sharp(oneChannel)
+    .median(3)
+    .threshold(otsuValue)
+    .toBuffer();
+
+  return {
+    processed,
+    otsuValue,
+    channel: ch,
+    width: meta.width,
+    height: meta.height,
+    upscaled_to: targetWidth,
+  };
+}
+
+// Pass 1: gentle pipeline. JANGAN lakukan hard binarization (sharp.threshold)
+// — biarkan tesseract internal binarize secara adaptif. Hasilnya lebih bagus
+// untuk teks kecil dense (banyak item, font 6-8pt).
+async function preprocessPrintedGentle(inputBuffer) {
+  const meta = await sharp(inputBuffer).rotate().metadata();
+  const targetWidth = Math.max(meta.width || 0, PRINTED_TARGET_WIDTH);
+
+  const processed = await sharp(inputBuffer)
+    .rotate()
+    .resize({
+      width: targetWidth,
+      kernel: "lanczos3",
+      withoutEnlargement: false,
+    })
+    .greyscale()
+    .normalize()
+    .linear(1.25, -20) // boost kontras lokal
+    .sharpen({ sigma: 0.5 }) // sharpen ringan
+    .toBuffer();
+
+  return {
+    processed,
+    width: meta.width,
+    height: meta.height,
+    upscaled_to: targetWidth,
+  };
+}
+
+// Pass 2: aggressive pipeline (Otsu binarization). Fallback kalau gentle
+// gagal extract item — biasanya untuk nota kontras tinggi sederhana atau
+// nota dengan banyak grafik/garis tebal.
+async function preprocessPrintedAggressive(inputBuffer) {
+  const meta = await sharp(inputBuffer).rotate().metadata();
+  const targetWidth = Math.max(meta.width || 0, PRINTED_TARGET_WIDTH);
+
+  const { data: rawGrey } = await sharp(inputBuffer)
+    .rotate()
+    .resize({
+      width: targetWidth,
+      kernel: "lanczos3",
+      withoutEnlargement: false,
+    })
+    .greyscale()
     .raw()
     .toBuffer({ resolveWithObject: true });
   const otsuValue = computeOtsuThreshold(rawGrey);
-  console.log(
-    `[POS-OCR] Otsu threshold = ${otsuValue} (image ${info.width}x${info.height})`
-  );
 
-  // (c) Apply: threshold + median blur kernel 3 + normalize untuk kontras
   const processed = await sharp(inputBuffer)
+    .rotate()
+    .resize({
+      width: targetWidth,
+      kernel: "lanczos3",
+      withoutEnlargement: false,
+    })
     .greyscale()
     .normalize()
     .median(3)
     .threshold(otsuValue)
     .toBuffer();
 
-  return { processed, otsuValue, width: info.width, height: info.height };
+  return {
+    processed,
+    otsuValue,
+    width: meta.width,
+    height: meta.height,
+    upscaled_to: targetWidth,
+  };
+}
+
+// Backward-compat: existing tests/import yang panggil preprocessPrinted langsung
+// akan dapat pipeline gentle (default baru).
+async function preprocessPrinted(inputBuffer) {
+  return preprocessPrintedGentle(inputBuffer);
 }
 
 // ---------- 3. Tesseract recognize (worker reusable) ----------
@@ -136,6 +290,13 @@ async function getWorker() {
           console.log(`[POS-OCR] Recognize done (jobId=${m.jobId})`);
         }
       },
+    });
+    // PSM 6 = single uniform block of text — paling cocok untuk receipt table
+    // dengan baris-baris item beraturan. preserve_interword_spaces menjaga
+    // gap antar kolom supaya parser regex bisa pisahkan field.
+    await worker.setParameters({
+      tessedit_pageseg_mode: "6",
+      preserve_interword_spaces: "1",
     });
     _worker = worker;
     return worker;
@@ -158,16 +319,47 @@ async function terminateWorker() {
 //   "SCM-001  Kampas Rem Beat   3 pcs  Rp 25.000   10%"
 // Strategi: per baris, ekstrak field dengan regex; abaikan baris header/total.
 
+// Header tabel + footer + label non-item yang sering muncul di nota Indonesia.
+// Baris yang start-with kata-kata ini akan di-skip di parser.
 const SKIP_LINE_RE =
-  /^(total|sub\s?total|grand\s?total|invoice|nota|tanggal|tgl|tanda terima|hormat|tunai|kembalian|ppn|pajak|diskon\s+total)/i;
+  /^(total|sub\s?total|grand\s?total|invoice|nota|tanggal|tgl|tanda\s+terima|hormat|tunai|kembalian|ppn|pajak|diskon\s+total|pot\.?|potongan|biaya|terbilang|disetujui|disiapkan|kepada|alamat|telp\.?|hp|email|kode\s+pel|nama\s+pel|kabag|disetorkan|banyaknya|nama\s+barang|harga\s|jumlah|kode\s|qty\s*$|barang\s*$|merk|satuan|admin|cashier|kasir|no\.?\s*kd|kd\.?\s*item|kd\.?\s*barang|nama\s*item|jml\b|sat\.?\s|pot\s*%|asia\s+jaya|dept|transaksi|s1[-\s]\d|tr\s*:|peja\s*:|hormat\s+kami)/i;
+
+// Pattern untuk pemisah multi-transaksi dalam satu nota (S1-XXXXXXXX).
+// OCR sering miss-read 'S1' jadi 'SL', 'Si', 'S|', '51', 'SI'. Pattern
+// dibuat fuzzy untuk variasi karakter awal yang lazim di Tesseract.
+// Saat ditemukan, parser anggap baris ini header transaksi baru, bukan item.
+const TRANSACTION_HEADER_RE = /\b(?:S[1lLI|i!]|51)[-\s]?\d{6,10}\b/;
+
+// Baris hanya berisi tanda baca/garis dekorasi (...) atau angka tunggal.
+function isDecorativeLine(text) {
+  const stripped = String(text || "").replace(/\s/g, "");
+  if (stripped.length < 4) return true;
+  // Lebih dari 60% karakter adalah tanda baca/garis → skip
+  const punctCount = (stripped.match(/[^a-zA-Z0-9]/g) || []).length;
+  if (punctCount / stripped.length > 0.6) return true;
+  // Tidak ada huruf sama sekali → skip
+  if (!/[a-zA-Z]/.test(stripped)) return true;
+  return false;
+}
 
 function parseAmount(str) {
-  // "Rp 25.000" / "1,234,567" / "1.234,50" → number
-  // Heuristik sederhana: hapus semua non-digit kecuali separator terakhir.
+  // Heuristik format Indonesia + OCR confusion handling.
+  //   "50.000,00"        → 50000     (titik=ribuan, koma=desimal)
+  //   "50.000.00"        → 50000     (OCR salah baca koma jadi titik — desimal di akhir)
+  //   "1.500.000"        → 1500000   (3 separator semua = ribuan)
+  //   "1.500"            → 1500      (1 separator + 3 digit = ribuan)
+  //   "1500"             → 1500      (tanpa separator)
+  //   "Rp 25,000"        → 25000     (style US: koma ribuan)
+  // Pendeteksi desimal: kalau diakhiri "[.,]\d{2}$" DAN ada digit lain sebelumnya,
+  // anggap 2 digit terakhir adalah sen → buang.
   const cleaned = String(str).replace(/[^\d.,]/g, "");
   if (!cleaned) return 0;
-  // Asumsikan separator ribuan ('.' atau ','). Hapus semuanya untuk ambil integer rupiah.
-  return parseFloat(cleaned.replace(/[.,]/g, "")) || 0;
+  const decimalMatch = cleaned.match(/^(.+)[.,](\d{2})$/);
+  if (decimalMatch) {
+    const intPart = decimalMatch[1].replace(/[.,]/g, "");
+    return parseInt(intPart, 10) || 0;
+  }
+  return parseInt(cleaned.replace(/[.,]/g, ""), 10) || 0;
 }
 
 function avgConfidenceOfWords(words) {
@@ -189,25 +381,73 @@ function wordsMatching(words, snippet) {
   );
 }
 
+// Daftar satuan yang diakui parser. Ditulis terpisah untuk ditest unit.
+// Indonesia common: kg, gr, bal, bks, bh, lusin, dus, krg, sak, ekor.
+// English/umum: pcs, pc, unit, set, pak, btl, ml, ltr, liter, l, roll.
+const UNIT_RE_SRC =
+  "pcs?|pc|unit|btl|botol|pak|paket|set|kg|gr|gram|bal|bks|bungkus|bh|buah|lusin|dus|krg|karung|liter|ltr|l|ml|ekor|roll|lbr|lembar|sak|kaleng|kotak|tube|sachet|rim|sht";
+
 function parseLineToItem(line) {
   const text = (line.text || "").trim();
   if (text.length < 6) return null;
   if (SKIP_LINE_RE.test(text)) return null;
+  if (TRANSACTION_HEADER_RE.test(text)) return null;
+  if (isDecorativeLine(text)) return null;
+  // Skip baris yang isinya cuma angka/separator (no letters) — biasanya line total
+  if (!/[a-zA-Z]/.test(text)) return null;
 
   const words = line.words || [];
 
-  // Field qty: angka diikuti satuan (pcs/pc/unit) ATAU didahului keyword qty/jml/jumlah/x
-  const qtyMatch =
-    text.match(/(?:qty|jml|jumlah|jum)\s*[:.]?\s*(\d{1,4})/i) ||
-    text.match(/\b(\d{1,4})\s*(?:pcs|pc|unit|btl|pak|set)\b/i) ||
-    text.match(/\b(\d{1,4})\s*x\s/i);
-  const qty = qtyMatch ? parseInt(qtyMatch[1], 10) : null;
+  // Field qty: prioritas pattern dengan satuan (pcs/kg/dll) karena
+  // paling tidak ambigu. Sanity cap: qty > 9999 hampir pasti misread
+  // dari nilai harga, jadi ditolak.
+  const qtyMatchPriority =
+    text.match(new RegExp(`\\b(\\d{1,4})(?:[.,]\\d+)?\\s*(?:${UNIT_RE_SRC})\\b`, "i")) ||
+    text.match(/(?:qty|jml|jumlah|jum|banyak)\s*[:.]?\s*(\d{1,4})/i) ||
+    text.match(/\b(\d{1,4})\s*x\s/i) ||
+    text.match(/^(\d{1,4})\s+[a-zA-Z]/);
+  const qtyRaw = qtyMatchPriority ? parseInt(qtyMatchPriority[1], 10) : null;
+  const qty = qtyRaw && qtyRaw <= 9999 ? qtyRaw : null;
+  const qtyMatch = qtyMatchPriority;
 
-  // Field harga_beli: setelah Rp/IDR ATAU angka besar dengan separator ribuan
-  const hargaMatch =
-    text.match(/(?:rp\.?|idr)\s*([\d.,]+)/i) ||
-    text.match(/\b(\d{1,3}(?:[.,]\d{3}){1,3})\b/);
-  const harga_beli = hargaMatch ? parseAmount(hargaMatch[1]) : null;
+  // Field harga_beli: cari SEMUA angka dengan separator ribuan (≥ 4 digit
+  // setelah dibersihkan), lalu pilih yang terbesar. Ini ngalahkan
+  // bug column-scrambling di mana qty/harga/total ketukar posisi —
+  // harga satuan biasanya angka terbesar yang masuk akal di line item.
+  // Pengecualian: kalau ada "Rp"/"IDR" prefix → ambil yang itu langsung.
+  let harga_beli = null;
+  let hargaMatch = text.match(/(?:rp\.?|idr)\s*([\d.,]+)/i);
+  if (hargaMatch) {
+    harga_beli = parseAmount(hargaMatch[1]);
+  } else {
+    // Token format normal (titik/koma separator ribuan)
+    const numericTokensDot = text.match(
+      /\b\d{1,3}(?:[.,]\d{3}){1,3}(?:[.,]\d{2})?\b/g
+    ) || [];
+    // Token format space-separator (Tesseract sering baca titik sebagai spasi).
+    // Pattern: digit 1-3 + (spasi + digit 3) minimal 1x.
+    // Contoh: "320 000" → 320000, "1 800 000" → 1800000.
+    const numericTokensSpace = text.match(/\b\d{1,3}(?:\s+\d{3}){1,3}\b/g) || [];
+    const numericTokens = [...numericTokensDot, ...numericTokensSpace];
+    const numericValues = numericTokens
+      .map((t) => parseAmount(t.replace(/\s+/g, ".")))
+      .filter((v) => v >= 1000); // harga sparepart minimal 1k
+    if (numericValues.length > 0) {
+      // Kalau hanya 1 angka → pakai. Kalau banyak (qty/harga/total),
+      // ambil MEDIAN supaya tidak terpengaruh outlier (total).
+      // Sortir, ambil tengah.
+      numericValues.sort((a, b) => a - b);
+      // Untuk 3 angka [qty_total, harga, total] median = harga.
+      // Untuk 2 angka pilih yang lebih kecil (harga vs total).
+      if (numericValues.length >= 3) {
+        harga_beli = numericValues[Math.floor(numericValues.length / 2)];
+      } else {
+        harga_beli = numericValues[0];
+      }
+      // Bangun stub hargaMatch untuk leftover stripping di bawah
+      hargaMatch = { 0: numericTokens.find((t) => parseAmount(t) === harga_beli) || numericTokens[0] };
+    }
+  }
 
   // Field diskon_persen: angka diikuti %
   const diskMatch = text.match(/(\d{1,2}(?:[.,]\d{1,2})?)\s*%/);
@@ -215,30 +455,37 @@ function parseLineToItem(line) {
     ? parseFloat(String(diskMatch[1]).replace(",", ".")) || 0
     : 0;
 
-  // Field kode_barang: token alfanumerik 4+ karakter (boleh berisi '-')
-  // Hindari menangkap "Rp", angka rupiah, dll.
-  const kodeMatch = text.match(/\b([A-Z][A-Z0-9]{2,}[-]?[A-Z0-9]{1,})\b/);
-  const kode_barang = kodeMatch ? kodeMatch[0] : "";
+  // Field kode_barang: pattern khas sparepart motor.
+  // Contoh real dari nota: 90111-08815, 93306-002YR, SVD-E1310-20,
+  // 5TL-E7623-00, BK6-F3145-00, 4YS-E4500-00, 401-16111-00-30, BPNE2228.
+  // Aturan: panjang ≥ 5, harus ada minimal 1 digit, boleh ada strip,
+  // huruf tidak melebihi 70% (cegah tangkap kata biasa seperti "PIRINGAN").
+  let kode_barang = "";
+  const kodeCandidates = text.match(/\b[A-Z0-9]+(?:-[A-Z0-9]+)*\b/g) || [];
+  for (const cand of kodeCandidates) {
+    if (cand.length < 5 || cand.length > 22) continue;
+    if (!/\d/.test(cand)) continue;
+    const letters = (cand.match(/[A-Z]/g) || []).length;
+    const total = cand.replace(/-/g, "").length;
+    if (letters / total > 0.7) continue;
+    // Reject pure numeric tanpa strip (kemungkinan harga/qty)
+    if (!cand.includes("-") && !/[A-Z]/.test(cand)) continue;
+    kode_barang = cand;
+    break;
+  }
+  const kodeMatch = kode_barang ? { 0: kode_barang } : null;
 
-  // Sisa untuk nama_barang: hilangkan field-field yang sudah ditangkap
+  // Sisa untuk nama_barang: hilangkan field-field yang sudah ditangkap.
+  // Pakai global regex untuk strip SEMUA occurrence harga/qty (bukan cuma yang
+  // pertama), karena nota typical menampilkan harga@unit dan total per row.
   let leftover = text;
-  const eaten = [];
-  if (qtyMatch) {
-    leftover = leftover.replace(qtyMatch[0], " ");
-    eaten.push(qtyMatch[0]);
-  }
-  if (hargaMatch) {
-    leftover = leftover.replace(hargaMatch[0], " ");
-    eaten.push(hargaMatch[0]);
-  }
-  if (diskMatch) {
-    leftover = leftover.replace(diskMatch[0], " ");
-    eaten.push(diskMatch[0]);
-  }
-  if (kodeMatch) {
-    leftover = leftover.replace(kodeMatch[0], " ");
-    eaten.push(kodeMatch[0]);
-  }
+  if (qtyMatch) leftover = leftover.replace(qtyMatch[0], " ");
+  // Strip semua angka berformat ribuan + prefix Rp/IDR + decimal opsional
+  leftover = leftover
+    .replace(/(?:rp\.?|idr)\s*[\d.,]+/gi, " ")
+    .replace(/\b\d{1,3}(?:[.,]\d{3}){1,3}(?:[.,]\d{2})?\b/g, " ");
+  if (diskMatch) leftover = leftover.replace(diskMatch[0], " ");
+  if (kodeMatch) leftover = leftover.replace(kodeMatch[0], " ");
   const nama_barang = leftover
     .replace(/[^a-zA-Z0-9\s/]/g, " ")
     .replace(/\s+/g, " ")
@@ -275,11 +522,62 @@ function parseLineToItem(line) {
 }
 
 function parseTesseractData(data) {
-  const lines = data?.lines || [];
+  let lines = data?.lines || [];
+  // Fallback: tesseract.js v6+ kadang tidak balas struktur lines lengkap saat
+  // PSM=6. Pecah data.text per newline secara manual. Word-level confidence
+  // hilang untuk line ini → kita seed dengan overall data.confidence supaya
+  // parser tetap bisa lapor angka, bukan 0%.
+  const overallConf = typeof data?.confidence === "number" ? data.confidence : 0;
+  if (lines.length === 0 && typeof data?.text === "string" && data.text.trim()) {
+    lines = data.text
+      .split(/\r?\n/)
+      .map((t) => ({
+        text: t,
+        // Bikin satu pseudo-word ber-confidence overall, supaya
+        // wordsMatching() di parseLineToItem mengembalikan ≥1 word
+        // dan avgConfidenceOfWords() balas overallConf, bukan 0.
+        words: t.trim()
+          ? [{ text: t, confidence: overallConf }]
+          : [],
+      }))
+      .filter((l) => l.text.trim().length > 0);
+  }
   const items = [];
+  // Multi-transaksi: sebuah nota bisa berisi beberapa transaksi berurutan
+  // (S1-25120493, S1-25120494, dst.). Tiap line yang match TRANSACTION_HEADER_RE
+  // = pemisah → naikkan transactionIndex. Item yang sudah keluar akan
+  // di-tag dengan transactionIndex saat ini.
+  let transactionIndex = 0;
+  let lastTransactionCode = null;
   for (const line of lines) {
+    const text = (line.text || "").trim();
+    const trxMatch = text.match(/\b(?:S[1lLI|i!]|51)[-\s]?(\d{6,10})\b/);
+    if (trxMatch) {
+      // Naikkan index hanya kalau kode transaksi baru (bukan duplikasi OCR)
+      const code = trxMatch[0];
+      if (code !== lastTransactionCode) {
+        if (items.length > 0) transactionIndex++;
+        lastTransactionCode = code;
+      }
+      continue; // baris header, jangan parse jadi item
+    }
     const item = parseLineToItem(line);
-    if (item) items.push(item);
+    if (item) {
+      // Annotate dengan overall confidence sebagai cadangan terakhir
+      const allZero = Object.values(item.confidence).every((v) => v === 0);
+      if (allZero && overallConf > 0) {
+        item.confidence = {
+          kode_barang: overallConf,
+          nama_barang: overallConf,
+          qty: overallConf,
+          harga_beli: overallConf,
+          diskon_persen: overallConf,
+        };
+      }
+      item.transaction_index = transactionIndex;
+      item.transaction_code = lastTransactionCode || null;
+      items.push(item);
+    }
   }
   return items;
 }
@@ -299,26 +597,123 @@ function flagLowConfidence(items, threshold = 60) {
   });
 }
 
-// ---------- 6a. Entry point CETAK ----------
+// ---------- 6a. Entry point CETAK (multi-strategy + multi-PSM) ----------
+//
+// Strategi pipeline (dipilih otomatis):
+//   - Kalau kertas berwarna terdeteksi (mean_R - mean_B > 18 dst.) →
+//     pipeline 'colored' (extractChannel → Otsu) sebagai pass 1.
+//   - Kalau tidak → pipeline 'gentle' standar.
+//   - Selalu coba pipeline 'aggressive' (Otsu global pada grayscale)
+//     sebagai fallback bila pass 1 hasil ≤ 1 item.
+//
+// Untuk tiap pipeline, jalankan tesseract dengan 2 PSM (6 = single block,
+// 4 = variable column / multi-column tabular). PSM 4 sering lebih bagus
+// untuk nota dengan tabel rapat. Pilih PSM yang menghasilkan item terbanyak.
+//
+// Skor kualitas: items yang ada minimal kode_barang ATAU dua field numerik
+// dihitung sebagai "valid". Pipeline+PSM dengan jumlah valid terbanyak menang.
+function countValidItems(items) {
+  if (!items) return 0;
+  let valid = 0;
+  for (const it of items) {
+    const r = it.raw || {};
+    const hasKode = r.kode_barang && String(r.kode_barang).length >= 5;
+    const numericCount =
+      (r.qty > 0 ? 1 : 0) + (r.harga_beli > 0 ? 1 : 0);
+    if (hasKode || numericCount >= 2) valid++;
+  }
+  return valid;
+}
+
+async function recognizeWithPsm(worker, processedBuffer, psm) {
+  await worker.setParameters({
+    tessedit_pageseg_mode: String(psm),
+    preserve_interword_spaces: "1",
+  });
+  const { data } = await worker.recognize(processedBuffer);
+  return data;
+}
+
+async function tryPipelineMultiPsm(worker, processedBuffer, label) {
+  let best = { data: null, items: [], psm: 6, valid: -1 };
+  for (const psm of [6, 4]) {
+    const data = await recognizeWithPsm(worker, processedBuffer, psm);
+    const items = flagLowConfidence(parseTesseractData(data), 60);
+    const valid = countValidItems(items);
+    console.log(
+      `[POS-OCR] ${label} PSM=${psm} → ${items.length} item (${valid} valid)`
+    );
+    if (valid > best.valid || (valid === best.valid && items.length > best.items.length)) {
+      best = { data, items, psm, valid };
+    }
+  }
+  return best;
+}
+
 async function recognizePrintedReceipt(inputBuffer) {
-  const { processed, otsuValue, width, height } = await preprocessPrinted(inputBuffer);
-
   const worker = await getWorker();
-  const { data } = await worker.recognize(processed);
-  const rawText = data.text || "";
 
-  let items = parseTesseractData(data);
-  items = flagLowConfidence(items, 60); // Strategi 3: ambang cetak
+  // Deteksi warna kertas dulu — ini yang menentukan pipeline default.
+  const color = await detectPaperColor(inputBuffer);
+  console.log(
+    `[POS-OCR] Paper color: R=${color.mean_r} G=${color.mean_g} B=${color.mean_b} colored=${color.is_colored} ch=${color.dominant_channel}`
+  );
+
+  let chosen = null;
+  let pipelineUsed = "";
+  let otsuValue = null;
+  let metaWidth = 0;
+  let metaHeight = 0;
+  let upscaledTo = 0;
+
+  if (color.is_colored) {
+    // Kertas berwarna — pipeline colored channel sebagai utama
+    const colored = await preprocessPrintedColored(inputBuffer, color.dominant_channel);
+    const result = await tryPipelineMultiPsm(
+      worker,
+      colored.processed,
+      `colored/${colored.channel}`
+    );
+    chosen = result;
+    pipelineUsed = `sharp/printed/colored-${colored.channel}/psm${result.psm}`;
+    otsuValue = colored.otsuValue;
+    metaWidth = colored.width;
+    metaHeight = colored.height;
+    upscaledTo = colored.upscaled_to;
+  } else {
+    // Kertas putih — pipeline gentle dulu
+    const gentle = await preprocessPrintedGentle(inputBuffer);
+    const result = await tryPipelineMultiPsm(worker, gentle.processed, "gentle");
+    chosen = result;
+    pipelineUsed = `sharp/printed/gentle/psm${result.psm}`;
+    metaWidth = gentle.width;
+    metaHeight = gentle.height;
+    upscaledTo = gentle.upscaled_to;
+  }
+
+  // Fallback: kalau pass utama tidak hasilkan cukup item, coba aggressive Otsu.
+  if (chosen.valid <= 1) {
+    console.log("[POS-OCR] Pass utama hasil minim → retry aggressive (Otsu global)");
+    const aggressive = await preprocessPrintedAggressive(inputBuffer);
+    const result = await tryPipelineMultiPsm(worker, aggressive.processed, "aggressive");
+    if (result.valid > chosen.valid) {
+      chosen = result;
+      pipelineUsed = `sharp/printed/aggressive/psm${result.psm}`;
+      otsuValue = aggressive.otsuValue;
+    }
+  }
 
   return {
-    raw_text: rawText,
+    raw_text: chosen.data?.text || "",
     preprocessing: {
-      pipeline: "sharp/printed",
+      pipeline: pipelineUsed,
       otsu_threshold: otsuValue,
-      width,
-      height,
+      paper_color: color,
+      width: metaWidth,
+      height: metaHeight,
+      upscaled_to: upscaledTo,
     },
-    items,
+    items: chosen.items,
   };
 }
 
@@ -432,8 +827,12 @@ function deskewPerLineMat(binaryMat, cv) {
 async function preprocessHandwritten(inputBuffer) {
   const cv = getCv(); // throw OCV_NOT_AVAILABLE jika modul tidak ada
 
+  // Pre-rotate via sharp untuk hormati EXIF orientation (foto kamera HP),
+  // re-encode jadi PNG buffer baru → opencv decode.
+  const orientedBuffer = await sharp(inputBuffer).rotate().toBuffer();
+
   // Decode buffer → Mat. opencv4nodejs.imdecode menerima Buffer.
-  let src = cv.imdecode(inputBuffer);
+  let src = cv.imdecode(orientedBuffer);
   if (!src || src.empty) {
     throw new Error("Gagal decode gambar dengan opencv4nodejs");
   }
@@ -492,6 +891,12 @@ async function recognizeHandwrittenReceipt(inputBuffer) {
     await preprocessHandwritten(inputBuffer);
 
   const worker = await getWorker();
+  // Reset PSM ke 6 — pipeline printed multi-PSM bisa meninggalkan PSM=4
+  // di worker shared. Tulisan tangan paling cocok dengan PSM 6 (single block).
+  await worker.setParameters({
+    tessedit_pageseg_mode: "6",
+    preserve_interword_spaces: "1",
+  });
   const { data } = await worker.recognize(processed);
   const rawText = data.text || "";
 

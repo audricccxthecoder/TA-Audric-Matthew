@@ -21,6 +21,7 @@
 const ocrService = require("./ocrService");
 const notaClassifier = require("./notaClassifierService");
 const stringMatcher = require("./stringMatchingService");
+const pdfService = require("./pdfService");
 const ruleEngine = require("./ruleEngine");
 const purchaseRepository = require("../repositories/purchaseRepository");
 const stockLogRepository = require("../repositories/stockLogRepository");
@@ -84,12 +85,108 @@ async function processOcr({ user, file, noNotaSupplier, notaType }) {
   });
   const signedUrl = await purchaseRepository.createNotaSignedUrl(filePath);
 
+  // (b1) JALUR PDF — kalau mimetype application/pdf, coba ekstrak text-layer
+  // langsung dulu (akurasi ~100% kalau PDF "lahir digital"). Kalau text-layer
+  // kosong (PDF scan), render halaman 1 jadi PNG dan lanjutkan ke pipeline
+  // OCR gambar yang sudah ada.
+  let workingBuffer = file.buffer;
+  let pdfMeta = null;
+  if (file.mimetype === "application/pdf") {
+    try {
+      const extracted = await pdfService.extractPdfText(file.buffer);
+      console.log(
+        `[POS-OCR] PDF detected: ${extracted.pageCount} pages, ${extracted.alphanumCount} alphanumeric chars, isDigital=${extracted.isDigital}`
+      );
+      if (extracted.isDigital) {
+        // Parse text PDF langsung pakai parser yang sama, tanpa Tesseract.
+        const fakeData = { text: extracted.text, lines: [], confidence: 99 };
+        let items = ocrService.flagLowConfidence(
+          ocrService.parseTesseractData(fakeData),
+          60
+        );
+        // Levenshtein matching
+        const catalog = await purchaseRepository.listActiveProductsForMatching();
+        const itemsWithCandidates = items.map((item, idx) => ({
+          index: idx,
+          raw: item.raw,
+          confidence: item.confidence,
+          confidence_avg: item.confidence_avg,
+          low_confidence: item.low_confidence,
+          line_text: item.line_text,
+          transaction_index: item.transaction_index,
+          transaction_code: item.transaction_code,
+          candidates: stringMatcher.findTopCandidates({
+            ocrName: item.raw.nama_barang,
+            ocrKode: item.raw.kode_barang,
+            products: catalog,
+            topN: 3,
+          }),
+        }));
+        const quality = computeOcrQualityStats(items);
+        console.log(
+          `[POS-OCR] User=${user.username} PDF text-layer → ${itemsWithCandidates.length} item (avg_conf=${quality.avg_confidence.toFixed(1)})`
+        );
+        return {
+          status: "unsaved",
+          file_nota_url: filePath,
+          file_nota_signed_url: signedUrl,
+          no_nota_supplier: noNotaSupplier || null,
+          nota_type: "cetak", // PDF digital diperlakukan setara cetak
+          classification: null,
+          raw_text: extracted.text,
+          preprocessing: {
+            pipeline: "pdf/text-layer-extract",
+            page_count: extracted.pageCount,
+            alphanum_chars: extracted.alphanumCount,
+          },
+          quality,
+          items: itemsWithCandidates,
+        };
+      }
+      // Text layer kosong → fallback render halaman 1 ke PNG
+      try {
+        const pngBuffer = await pdfService.renderPdfFirstPagePng(file.buffer);
+        workingBuffer = pngBuffer;
+        pdfMeta = {
+          fallback_to_image: true,
+          page_count: extracted.pageCount,
+        };
+        console.log("[POS-OCR] PDF text-layer kosong → render halaman 1 ke PNG, lanjut OCR gambar");
+      } catch (renderErr) {
+        console.warn("[POS-OCR] Gagal render PDF ke PNG:", renderErr.message);
+        return {
+          status: "manual_input_required",
+          file_nota_url: filePath,
+          file_nota_signed_url: signedUrl,
+          no_nota_supplier: noNotaSupplier || null,
+          nota_type: "cetak",
+          classification: null,
+          reason:
+            "PDF tidak punya text-layer dan rendering ke gambar gagal. Silakan input manual.",
+          items: [],
+        };
+      }
+    } catch (err) {
+      console.warn("[POS-OCR] PDF extract error:", err.message);
+      return {
+        status: "manual_input_required",
+        file_nota_url: filePath,
+        file_nota_signed_url: signedUrl,
+        no_nota_supplier: noNotaSupplier || null,
+        nota_type: "cetak",
+        classification: null,
+        reason: "Gagal membaca PDF. Silakan input manual atau upload format JPG/PNG.",
+        items: [],
+      };
+    }
+  }
+
   // (b) STRATEGI 1 — klasifikasi awal jika user belum override.
   let resolvedType = normalizeNotaType(notaType);
   let classification = null;
   if (!resolvedType) {
     try {
-      classification = await notaClassifier.classifyNota(file.buffer);
+      classification = await notaClassifier.classifyNota(workingBuffer);
     } catch (err) {
       console.warn("[POS-OCR] classifier error:", err.message);
       classification = { type: "ambigu", features: { error: err.message } };
@@ -117,9 +214,13 @@ async function processOcr({ user, file, noNotaSupplier, notaType }) {
   let ocrResult;
   try {
     if (resolvedType === "tulisan_tangan") {
-      ocrResult = await ocrService.recognizeHandwrittenReceipt(file.buffer);
+      ocrResult = await ocrService.recognizeHandwrittenReceipt(workingBuffer);
     } else {
-      ocrResult = await ocrService.recognizePrintedReceipt(file.buffer);
+      ocrResult = await ocrService.recognizePrintedReceipt(workingBuffer);
+    }
+    // Annotate hasil dengan info PDF kalau memang fallback dari PDF→PNG
+    if (pdfMeta && ocrResult?.preprocessing) {
+      ocrResult.preprocessing.from_pdf = pdfMeta;
     }
   } catch (err) {
     // OCV_NOT_AVAILABLE: opencv4nodejs belum ter-install / build gagal.
@@ -282,4 +383,54 @@ async function listPurchases(filter) {
   return purchaseRepository.list(filter);
 }
 
-module.exports = { processOcr, commitPurchase, listPurchases };
+// ---------- Drafts (Cross-device Resume) ----------
+async function saveDraft({ user, payload }) {
+  if (!payload?.file_nota_url) {
+    const e = new Error("file_nota_url wajib ada untuk menyimpan draft");
+    e.status = 400;
+    throw e;
+  }
+  return purchaseRepository.saveDraft({
+    draftId: payload.id || null,
+    userId: user.id,
+    noNotaSupplier: payload.no_nota_supplier,
+    fileNotaUrl: payload.file_nota_url,
+    notaType: payload.nota_type,
+    rawText: payload.raw_text,
+    preprocessing: payload.preprocessing,
+    quality: payload.quality,
+    items: payload.items,
+    status: payload.status,
+  });
+}
+
+async function listDrafts({ user }) {
+  return purchaseRepository.listDrafts(user.id);
+}
+
+async function getDraft({ user, draftId }) {
+  const draft = await purchaseRepository.getDraft({
+    draftId,
+    userId: user.id,
+  });
+  if (!draft) {
+    const e = new Error("Draft tidak ditemukan");
+    e.status = 404;
+    throw e;
+  }
+  return draft;
+}
+
+async function deleteDraft({ user, draftId }) {
+  return purchaseRepository.deleteDraft({ draftId, userId: user.id });
+}
+
+module.exports = {
+  processOcr,
+  commitPurchase,
+  listPurchases,
+  saveDraft,
+  listDrafts,
+  getDraft,
+  deleteDraft,
+};

@@ -31,10 +31,12 @@ const TILT_HANDWRITING_MIN_DEG = 10; // tilt >=10° → miring (tulisan tangan)
 
 // ---- (a) Standardisasi ukuran ----
 async function normalizeForClassification(inputBuffer) {
-  // Convert ke grayscale, resize ke max 800px lebar, raw buffer 1 channel
-  const meta = await sharp(inputBuffer).metadata();
+  // Convert ke grayscale, resize ke max 800px lebar, raw buffer 1 channel.
+  // .rotate() = auto-orient EXIF (foto langsung dari kamera HP).
+  const meta = await sharp(inputBuffer).rotate().metadata();
   const targetWidth = Math.min(800, meta.width || 800);
   const { data, info } = await sharp(inputBuffer)
+    .rotate()
     .greyscale()
     .resize({ width: targetWidth, withoutEnlargement: true })
     .raw()

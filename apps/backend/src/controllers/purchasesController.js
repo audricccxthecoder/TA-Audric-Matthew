@@ -75,4 +75,69 @@ async function listPurchases(req, res) {
   }
 }
 
-module.exports = { processOcr, commitPurchase, listPurchases };
+// =============== DRAFT ENDPOINTS ===============
+
+async function saveDraft(req, res) {
+  try {
+    const draft = await purchasesService.saveDraft({
+      user: req.user,
+      payload: req.body || {},
+    });
+    return res.status(200).json({
+      message: "Draft tersimpan",
+      data: draft,
+    });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("[POS-PURCHASES] saveDraft:", err.message);
+    return res.status(status).json({ error: err.message });
+  }
+}
+
+async function listDrafts(req, res) {
+  try {
+    const data = await purchasesService.listDrafts({ user: req.user });
+    return res.json({ data });
+  } catch (err) {
+    console.error("[POS-PURCHASES] listDrafts:", err.message);
+    return res.status(500).json({ error: "Gagal memuat daftar draft" });
+  }
+}
+
+async function getDraft(req, res) {
+  try {
+    const data = await purchasesService.getDraft({
+      user: req.user,
+      draftId: req.params.id,
+    });
+    return res.json({ data });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("[POS-PURCHASES] getDraft:", err.message);
+    return res.status(status).json({ error: err.message });
+  }
+}
+
+async function deleteDraft(req, res) {
+  try {
+    await purchasesService.deleteDraft({
+      user: req.user,
+      draftId: req.params.id,
+    });
+    return res.json({ message: "Draft dihapus" });
+  } catch (err) {
+    const status = err.status || 500;
+    if (status >= 500) console.error("[POS-PURCHASES] deleteDraft:", err.message);
+    return res.status(status).json({ error: err.message });
+  }
+}
+
+module.exports = {
+  processOcr,
+  commitPurchase,
+  listPurchases,
+  saveDraft,
+  listDrafts,
+  getDraft,
+  deleteDraft,
+};
