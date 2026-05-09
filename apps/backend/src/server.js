@@ -12,6 +12,7 @@ const dashboardRoutes = require("./routes/dashboard");
 const auditRoutes = require("./routes/audit");
 const reportsRoutes = require("./routes/reports");
 const restockRoutes = require("./routes/restock");
+const notificationRoutes = require("./routes/notifications");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -69,6 +70,7 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/audit-logs", auditRoutes);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/restock", restockRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 app.use((err, req, res, next) => {
   console.error("[POS-SRV]", err.stack);

@@ -27,8 +27,10 @@ sampai Pertemuan 10. Setiap berkas berisi tabel skenario per modul dengan kolom
 | [06-restock-r5.md](./06-restock-r5.md) | R5 Rekomendasi Restock | 3 |
 | [07-dashboard.md](./07-dashboard.md) | Dashboard Analytics (eaglance + modal) | 10 |
 | [08-laporan.md](./08-laporan.md) | Laporan Penjualan & Pembelian | 4 |
+| [09-konsistensi-stok.md](./09-konsistensi-stok.md) | Konsistensi Stok End-to-End (R1+R3+R4) | 8 |
+| [10-user-management.md](./10-user-management.md) | Manajemen User & Notifikasi Low-Stock | 11 |
 
-**Total: 48 skenario** (target minimal 30 ✓)
+**Total: 67 skenario** (target minimal 30 ✓)
 
 ## Lingkungan Pengujian
 

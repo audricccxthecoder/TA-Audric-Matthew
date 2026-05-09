@@ -38,6 +38,13 @@ async function authMiddleware(req, res, next) {
       return res.status(401).json({ error: "Profil user tidak ditemukan" });
     }
 
+    // Soft-deactivate (Pertemuan 13): admin bisa nonaktifkan akun lewat
+    // PATCH /api/users/:id/status. Sesi yang masih punya JWT valid pun
+    // langsung kehilangan akses karena dicek tiap request.
+    if (profile.is_active === false) {
+      return res.status(401).json({ error: "Akun Anda telah dinonaktifkan" });
+    }
+
     req.user = { ...user, ...profile };
     next();
   } catch (err) {

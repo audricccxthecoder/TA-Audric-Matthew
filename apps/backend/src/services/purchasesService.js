@@ -334,14 +334,26 @@ async function commitPurchase({ user, payload }) {
     throw e;
   }
 
-  // Normalisasi item agar fn_commit_purchase menerima tipe konsisten
-  const normalizedItems = items.map((it) => ({
-    product_id: it.product_id,
-    qty: Number(it.qty),
-    harga_beli: Number(it.harga_beli),
-    diskon_persen: Number(it.diskon_persen ?? 0),
-    source: it.source === "ocr" ? "ocr" : "manual",
-  }));
+  // Normalisasi item agar fn_commit_purchase menerima tipe konsisten.
+  // Pertemuan 12: item bisa action='restock' (pakai product_id) atau
+  // action='new' (kirim kode_barang + nama_barang supaya RPC INSERT produk baru).
+  const normalizedItems = items.map((it) => {
+    const action = it.action === "new" ? "new" : "restock";
+    const base = {
+      action,
+      qty: Number(it.qty),
+      harga_beli: Number(it.harga_beli),
+      diskon_persen: Number(it.diskon_persen ?? 0),
+      source: it.source === "ocr" ? "ocr" : "manual",
+    };
+    if (action === "new") {
+      base.kode_barang = String(it.kode_barang || "").trim();
+      base.nama_barang = String(it.nama_barang || "").trim();
+    } else {
+      base.product_id = it.product_id;
+    }
+    return base;
+  });
 
   // RPC atomik: INSERT purchases + INSERT purchase_items.
   // Trigger R4 (fn_purchase_items_apply) menambah products.stok + tulis stock_logs ACCEPTED.
@@ -373,8 +385,12 @@ async function commitPurchase({ user, payload }) {
   }
 
   const detail = await purchaseRepository.getPurchaseDetail(rpcResult.purchase_id);
+  // products_created: jumlah produk yang otomatis dibuat dari item action='new'
+  // (Pertemuan 12). Ditampilkan di toast frontend supaya user tahu master barang
+  // bertambah berapa.
+  detail.products_created = Number(rpcResult.products_created || 0);
   console.log(
-    `[POS-PURCHASES] Commit purchase_id=${rpcResult.purchase_id} oleh user=${user.username} total=${rpcResult.total} (${normalizedItems.length} item)`
+    `[POS-PURCHASES] Commit purchase_id=${rpcResult.purchase_id} oleh user=${user.username} total=${rpcResult.total} (${normalizedItems.length} item, ${detail.products_created} produk baru)`
   );
   return detail;
 }

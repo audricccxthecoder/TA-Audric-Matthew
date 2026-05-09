@@ -54,8 +54,11 @@ function checkR1StockAvailability({ items, products }) {
 }
 
 // R2 pre-check: validasi payload commit pembelian.
-// SYSTEM PROMPT: status_validasi WAJIB 'tervalidasi' (di-set client setelah konfirmasi)
-// dan setiap baris item WAJIB punya product_id (tidak boleh draft kosong).
+// Pertemuan 12: payload item bisa salah satu dari dua bentuk berdasarkan
+// keputusan user di UI (kode_barang match catalog atau buat produk baru):
+//   action='restock' → wajib product_id (UUID)
+//   action='new'     → wajib kode_barang + nama_barang (string)
+// Field umum: qty (int > 0), harga_beli (num ≥ 0), diskon_persen (0-100).
 function checkR2PurchaseValidation({ status_validasi, items }) {
   if (status_validasi !== "tervalidasi") {
     return {
@@ -72,11 +75,48 @@ function checkR2PurchaseValidation({ status_validasi, items }) {
   }
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
-    if (!it.product_id || typeof it.product_id !== "string") {
+    const action = it.action || "restock";
+    if (action !== "restock" && action !== "new") {
       return {
         ok: false,
-        reason: `R2: item baris #${i + 1} belum dipilih product_id (wajib pilih kandidat dari katalog)`,
+        reason: `R2: item baris #${i + 1} action harus 'restock' atau 'new'`,
       };
+    }
+    if (action === "restock") {
+      if (!it.product_id || typeof it.product_id !== "string") {
+        return {
+          ok: false,
+          reason: `R2: item baris #${i + 1} (restock) wajib menyertakan product_id`,
+        };
+      }
+    } else {
+      // action === 'new'
+      const kode = typeof it.kode_barang === "string" ? it.kode_barang.trim() : "";
+      const nama = typeof it.nama_barang === "string" ? it.nama_barang.trim() : "";
+      if (!kode) {
+        return {
+          ok: false,
+          reason: `R2: item baris #${i + 1} (produk baru) wajib menyertakan kode_barang`,
+        };
+      }
+      if (kode.length > 30) {
+        return {
+          ok: false,
+          reason: `R2: item baris #${i + 1} kode_barang terlalu panjang (maks 30 karakter)`,
+        };
+      }
+      if (!nama) {
+        return {
+          ok: false,
+          reason: `R2: item baris #${i + 1} (produk baru) wajib menyertakan nama_barang`,
+        };
+      }
+      if (nama.length > 150) {
+        return {
+          ok: false,
+          reason: `R2: item baris #${i + 1} nama_barang terlalu panjang (maks 150 karakter)`,
+        };
+      }
     }
     if (!Number.isInteger(it.qty) || it.qty <= 0) {
       return {
